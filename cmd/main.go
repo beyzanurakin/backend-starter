@@ -1,33 +1,79 @@
 package main
 
 import (
-    "context"
+    "database/sql"
     "fmt"
-    "github.com/beyzanurakin/backend-starter/pkg/logger"
+    "log"
     "os"
-    "os/signal"
-    "syscall"
+    "path/filepath"
+    "strings"
+    "sort"
+    _ "github.com/go-sql-driver/mysql"
 )
 
 func main() {
-    logger.InitLogger()
-    logger.Info("Application is starting...")
+    db, err := sql.Open("mysql", "root@tcp(127.0.0.1:3306)/mydb")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
-    stop := make(chan os.Signal, 1)
-    signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+    // Run migrations
+    err = migrate(db)
+    if err != nil {
+        log.Fatalf("Migration failed: %v", err)
+    }
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    go func() {
-        <-stop
-        logger.Info("Received shutdown signal. Cleaning up...")
-        cancel()
-    }()
-
-    <-ctx.Done()
-    fmt.Println("Cleanup complete, exiting program.")
+    fmt.Println("Migrations completed successfully")
 }
 
+// Migration function
+func migrate(db *sql.DB) error {
+    migrationsDir := "../migrations"
+    files, err := os.ReadDir(migrationsDir)
+    if err != nil {
+        return fmt.Errorf("failed to read migrations directory: %v", err)
+    }
 
+    // Sort migrations by name
+    sortedFiles := sortMigrationFiles(files)
 
+    // Apply migrations
+    for _, file := range sortedFiles {
+        filePath := filepath.Join(migrationsDir, file)
+        err := runMigration(db, filePath)
+        if err != nil {
+            return fmt.Errorf("failed to run migration '%s': %v", file, err)
+        }
+        fmt.Printf("Successfully applied migration: %s\n", file)
+    }
+    return nil
+}
+
+// Run a single migration file
+func runMigration(db *sql.DB, filePath string) error {
+    content, err := os.ReadFile(filePath)
+    if err != nil {
+        return fmt.Errorf("failed to read migration file %s: %v", filePath, err)
+    }
+
+    // Run the SQL content
+    _, err = db.Exec(string(content))
+    if err != nil {
+        return fmt.Errorf("failed to execute migration file %s: %v", filePath, err)
+    }
+
+    return nil
+}
+
+// Sort migration files by name (assuming the name format is "YYYYMMDD_HHMMSS_migration.sql")
+func sortMigrationFiles(files []os.DirEntry) []string {
+    var fileNames []string
+    for _, file := range files {
+        if !file.IsDir() && strings.HasSuffix(file.Name(), ".sql") {
+            fileNames = append(fileNames, file.Name())
+        }
+    }
+    sort.Strings(fileNames)
+    return fileNames
+}

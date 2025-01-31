@@ -1,0 +1,41 @@
+-- Users table
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(255) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Transactions table
+CREATE TABLE transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    from_user_id INT,
+    to_user_id INT,
+    amount DECIMAL(10, 2) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (from_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Balances table
+CREATE TABLE balances (
+    user_id INT PRIMARY KEY,
+    amount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Audit Logs table
+CREATE TABLE audit_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id INT NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    details TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
