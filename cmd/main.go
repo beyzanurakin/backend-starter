@@ -13,6 +13,12 @@ import (
     "time"
     "sync"
     "encoding/json"
+    "sync/atomic"
+)
+
+var (
+    successfulTransactions int32
+    failedTransactions     int32
 )
 
 func main() {
@@ -28,6 +34,33 @@ func main() {
     }
 
     fmt.Println("Migrations completed successfully")
+
+    transactionQueue := make(chan *Transaction, 100)
+    var wg sync.WaitGroup
+
+    for i := 0; i < 5; i++ {
+        wg.Add(1)
+        go worker(i, transactionQueue, &wg)
+    }
+
+    for i := 0; i < 10; i++ {
+        transactionQueue <- &Transaction{
+            ID:        i,
+            UserID:    i % 3,
+            Amount:    float64(i * 100),
+            Type:      "credit",
+            Status:    "pending",
+            CreatedAt: time.Now(),
+        }
+    }
+
+    close(transactionQueue)
+
+    wg.Wait()
+
+    fmt.Printf("Successful Transactions: %d\n", atomic.LoadInt32(&successfulTransactions))
+    fmt.Printf("Failed Transactions: %d\n", atomic.LoadInt32(&failedTransactions))
+
 }
 
 type User struct {
@@ -86,6 +119,30 @@ func (b *Balance) GetBalance() float64 {
     b.mu.Lock()
     defer b.mu.Unlock()
     return b.Amount
+}
+
+func worker(id int, transactionQueue <-chan *Transaction, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for transaction := range transactionQueue {
+        fmt.Printf("Worker %d processing transaction %d\n", id, transaction.ID)
+        if err := processTransaction(transaction); err != nil {
+            atomic.AddInt32(&failedTransactions, 1)
+            fmt.Printf("Worker %d failed to process transaction %d: %v\n", id, transaction.ID, err)
+        } else {
+            atomic.AddInt32(&successfulTransactions, 1)
+            fmt.Printf("Worker %d successfully processed transaction %d\n", id, transaction.ID)
+        }
+    }
+}
+
+func processTransaction(transaction *Transaction) error {
+    time.Sleep(500 * time.Millisecond)
+
+    if transaction.ID%2 == 0 {
+        return nil 
+    }
+
+    return errors.New("transaction processing failed")
 }
 
 type UserRepository interface {
