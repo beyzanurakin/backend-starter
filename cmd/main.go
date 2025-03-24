@@ -1,16 +1,40 @@
-package services
+package main
 
 import (
-    "database/sql"
-    "errors"
+    "encoding/json"
     "fmt"
-    "sync"
+    "log"
+    "net/http"
+    "strconv"
     "time"
+    "github.com/gorilla/mux"
+    "github.com/gorilla/handlers"
+    "golang.org/x/time/rate"
 )
 
-type BalanceService struct {
-    db *sql.DB
-    mu sync.Mutex
+var (
+    users       = map[int]User{}
+    transactions = map[int]Transaction{}
+    balances    = map[int]Balance{}
+    rateLimiter = rate.NewLimiter(rate.Every(time.Minute), 5)
+)
+
+type User struct {
+    ID       int    `json:"id"`
+    Name     string `json:"name"`
+    Email    string `json:"email"`
+    Password string `json:"password,omitempty"`
+    Role     string `json:"role"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+type Transaction struct {
+    ID        int       `json:"id"`
+    UserID    int       `json:"user_id"`
+    Amount    float64   `json:"amount"`
+    Type      string    `json:"type"`
+    Status    string    `json:"status"`
+    CreatedAt time.Time `json:"created_at"`
 }
 
 type Balance struct {
@@ -18,126 +42,281 @@ type Balance struct {
     Amount float64 `json:"amount"`
 }
 
-type BalanceHistory struct {
-    UserID    int       `json:"user_id"`
-    Amount    float64   `json:"amount"`
-    CreatedAt time.Time `json:"created_at"`
+func main() {
+    r := mux.NewRouter()
+    r.Use(authenticationMiddleware)
+    r.Use(performanceMonitoringMiddleware)
+    r.Use(requestValidationMiddleware)
+    r.Use(errorHandlingMiddleware)
+
+    adminRouter := r.PathPrefix("/admin").Subrouter()
+    adminRouter.Use(roleAuthorizationMiddleware("admin", adminRouter))
+
+    r.HandleFunc("/api/v1/auth/register", registerUser).Methods("POST")
+    r.HandleFunc("/api/v1/auth/login", loginUser).Methods("POST")
+    r.HandleFunc("/api/v1/users", getUsers).Methods("GET")
+    r.HandleFunc("/api/v1/users/{id}", getUser).Methods("GET")
+    r.HandleFunc("/api/v1/users/{id}", updateUser).Methods("PUT")
+    r.HandleFunc("/api/v1/users/{id}", deleteUser).Methods("DELETE")
+    r.HandleFunc("/api/v1/transactions/credit", creditTransaction).Methods("POST")
+    r.HandleFunc("/api/v1/transactions/debit", debitTransaction).Methods("POST")
+    r.HandleFunc("/api/v1/transactions/transfer", transferTransaction).Methods("POST")
+    r.HandleFunc("/api/v1/transactions/history", getTransactionHistory).Methods("GET")
+    r.HandleFunc("/api/v1/transactions/{id}", getTransaction).Methods("GET")
+    r.HandleFunc("/api/v1/balances/current", getCurrentBalance).Methods("GET")
+    r.HandleFunc("/api/v1/balances/historical", getHistoricalBalance).Methods("GET")
+
+    http.ListenAndServe(":8080", r)
 }
 
-func NewBalanceService(db *sql.DB) *BalanceService {
-    return &BalanceService{db: db}
+func authenticationMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        tokenString := r.Header.Get("Authorization")
+        if tokenString == "" {
+            http.Error(w, "Authorization token required", http.StatusUnauthorized)
+            return
+        }
+
+        tokenString = tokenString[len("Bearer "):]
+        claims := jwt.MapClaims{}
+        token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+            return []byte("your_secret_key"), nil
+        })
+        if err != nil || !token.Valid {
+            http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+            return
+        }
+
+        userID := claims["user_id"].(float64)
+        r.Header.Set("User-ID", fmt.Sprintf("%v", userID))
+
+        next.ServeHTTP(w, r)
+    })
 }
 
-func (s *BalanceService) GetBalance(userID int) (float64, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    var balance float64
-    err := s.db.QueryRow("SELECT SUM(amount) FROM balance_history WHERE user_id = ?", userID).Scan(&balance)
-    if err != nil {
-        return 0, fmt.Errorf("could not fetch balance: %v", err)
-    }
-
-    return balance, nil
+func roleAuthorizationMiddleware(requiredRole string, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        userRole := r.Header.Get("Role")
+        if userRole != requiredRole {
+            http.Error(w, "Forbidden: You do not have the necessary permissions", http.StatusForbidden)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
 }
 
-func (s *BalanceService) AddFunds(userID int, amount float64) error {
-    if amount <= 0 {
-        return errors.New("amount must be greater than zero")
-    }
+func requestValidationMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == http.MethodPost || r.Method == http.MethodPut {
+            var requestBody map[string]interface{}
+            decoder := json.NewDecoder(r.Body)
+            if err := decoder.Decode(&requestBody); err != nil {
+                http.Error(w, "Invalid JSON format", http.StatusBadRequest)
+                return
+            }
 
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    _, err := s.db.Exec("INSERT INTO balance_history (user_id, amount, created_at) VALUES (?, ?, ?)",
-        userID, amount, time.Now())
-    if err != nil {
-        return fmt.Errorf("could not add funds: %v", err)
-    }
-
-    return nil
+            if requestBody["name"] == nil || requestBody["email"] == nil {
+                http.Error(w, "Missing required fields", http.StatusBadRequest)
+                return
+            }
+        }
+        next.ServeHTTP(w, r)
+    })
 }
 
-func (s *BalanceService) SubtractFunds(userID int, amount float64) error {
-    if amount <= 0 {
-        return errors.New("amount must be greater than zero")
-    }
-
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    currentBalance, err := s.GetBalance(userID)
-    if err != nil {
-        return err
-    }
-
-    if currentBalance < amount {
-        return errors.New("insufficient balance")
-    }
-
-    _, err = s.db.Exec("INSERT INTO balance_history (user_id, amount, created_at) VALUES (?, ?, ?)",
-        userID, -amount, time.Now())
-    if err != nil {
-        return fmt.Errorf("could not subtract funds: %v", err)
-    }
-
-    return nil
+func errorHandlingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if err := recover(); err != nil {
+                http.Error(w, fmt.Sprintf("Internal Server Error: %v", err), http.StatusInternalServerError)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
 }
 
-func (s *BalanceService) TransferFunds(fromUserID, toUserID int, amount float64) error {
-    if amount <= 0 {
-        return errors.New("amount must be greater than zero")
-    }
 
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    fromUserBalance, err := s.GetBalance(fromUserID)
-    if err != nil {
-        return err
-    }
-
-    if fromUserBalance < amount {
-        return errors.New("insufficient balance for the sender")
-    }
-
-    _, err = s.db.Exec("INSERT INTO balance_history (user_id, amount, created_at) VALUES (?, ?, ?)",
-        fromUserID, -amount, time.Now())
-    if err != nil {
-        return fmt.Errorf("could not subtract funds from sender: %v", err)
-    }
-
-    _, err = s.db.Exec("INSERT INTO balance_history (user_id, amount, created_at) VALUES (?, ?, ?)",
-        toUserID, amount, time.Now())
-    if err != nil {
-        return fmt.Errorf("could not add funds to receiver: %v", err)
-    }
-
-    return nil
+func loggingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        log.Printf("Request: %s %s", r.Method, r.URL.Path)
+        next.ServeHTTP(w, r)
+    })
 }
 
-func (s *BalanceService) RollbackTransaction(userID int, amount float64) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    _, err := s.db.Exec("INSERT INTO balance_history (user_id, amount, created_at) VALUES (?, ?, ?)",
-        userID, -amount, time.Now())
-    if err != nil {
-        return fmt.Errorf("could not rollback transaction: %v", err)
-    }
-
-    return nil
+func corsMiddleware(next http.Handler) http.Handler {
+    return handlers.CORS(
+        handlers.AllowedOrigins([]string{"http://localhost:3000"}),
+        handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE"}),
+        handlers.AllowedHeaders([]string{"Content-Type", "Authorization"}),
+    )(next)
 }
 
-func (s *BalanceService) GetOptimizedBalance(userID int) (float64, error) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
+func rateLimitMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if !rateLimiter.Allow() {
+            http.Error(w, "Too many requests", http.StatusTooManyRequests)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
 
-    var balance float64
-    err := s.db.QueryRow("SELECT SUM(amount) FROM balance_history WHERE user_id = ?", userID).Scan(&balance)
-    if err != nil {
-        return 0, fmt.Errorf("could not fetch optimized balance: %v", err)
+func authMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        token := r.Header.Get("Authorization")
+        if token == "" {
+            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
+func registerUser(w http.ResponseWriter, r *http.Request) {
+    var user User
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&user); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
     }
 
-    return balance, nil
+    fmt.Fprintf(w, "User %s registered successfully", user.Name)
+}
+
+
+func loginUser(w http.ResponseWriter, r *http.Request) {
+    var user User
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&user); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    token, err := generateJWT(user)
+    if err != nil {
+        http.Error(w, "Authentication failed", http.StatusUnauthorized)
+        return
+    }
+
+    w.Header().Set("Authorization", "Bearer "+token)
+    fmt.Fprintf(w, "User %s logged in successfully", user.Name)
+}
+
+
+func refreshToken(w http.ResponseWriter, r *http.Request) {
+    token := r.Header.Get("Authorization")
+    
+    fmt.Fprintf(w, "Token refreshed successfully")
+}
+
+
+func getUsers(w http.ResponseWriter, r *http.Request) {
+    users := []User{
+        {ID: 1, Name: "John Doe", Email: "john@example.com"},
+        {ID: 2, Name: "Jane Doe", Email: "jane@example.com"},
+    }
+    
+    json.NewEncoder(w).Encode(users)
+}
+
+
+func getUser(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    id := vars["id"]
+
+    user := User{ID: 1, Name: "John Doe", Email: "john@example.com"}
+
+    json.NewEncoder(w).Encode(user)
+}
+
+
+func updateUser(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    id := vars["id"]
+    
+    var user User
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&user); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+
+    fmt.Fprintf(w, "User %s updated successfully", id)
+}
+
+
+func deleteUser(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    id := vars["id"]
+
+    fmt.Fprintf(w, "User %s deleted successfully", id)
+}
+
+func creditTransaction(w http.ResponseWriter, r *http.Request) {
+    var transaction Transaction
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&transaction); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    fmt.Fprintf(w, "Credit transaction of %f for user %d completed", transaction.Amount, transaction.UserID)
+}
+
+
+func debitTransaction(w http.ResponseWriter, r *http.Request) {
+    var transaction Transaction
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&transaction); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    fmt.Fprintf(w, "Debit transaction of %f for user %d completed", transaction.Amount, transaction.UserID)
+}
+
+
+func transferTransaction(w http.ResponseWriter, r *http.Request) {
+    var transaction Transaction
+    decoder := json.NewDecoder(r.Body)
+    if err := decoder.Decode(&transaction); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    fmt.Fprintf(w, "Transfer transaction of %f from user %d completed", transaction.Amount, transaction.UserID)
+}
+
+func getTransactionHistory(w http.ResponseWriter, r *http.Request) {
+    transactions := []Transaction{
+        {ID: 1, UserID: 1, Amount: 100, Type: "credit"},
+        {ID: 2, UserID: 1, Amount: 50, Type: "debit"},
+    }
+    
+    json.NewEncoder(w).Encode(transactions)
+}
+
+func getTransaction(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    id := vars["id"]
+
+    transaction := Transaction{ID: 1, UserID: 1, Amount: 100, Type: "credit"}
+
+    json.NewEncoder(w).Encode(transaction)
+}
+
+func getCurrentBalance(w http.ResponseWriter, r *http.Request) {
+    balance := Balance{UserID: 1, Amount: 1000.0}
+    
+    json.NewEncoder(w).Encode(balance)
+}
+
+func getHistoricalBalance(w http.ResponseWriter, r *http.Request) {
+    historicalBalance := []Balance{
+        {UserID: 1, Amount: 950.0},
+        {UserID: 1, Amount: 1000.0},
+    }
+    
+    json.NewEncoder(w).Encode(historicalBalance)
 }
