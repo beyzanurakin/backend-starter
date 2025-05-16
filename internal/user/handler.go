@@ -1,41 +1,71 @@
-package user
+package transaction
 
 import (
-    "encoding/json"
-    "net/http"
-    "strconv"
+	"encoding/json"
+	"net/http"
+	"strconv"
 
-    "github.com/gorilla/mux"
+	"github.com/gorilla/mux"
 )
 
-func RegisterUser(w http.ResponseWriter, r *http.Request) {
-    var user User
-    json.NewDecoder(r.Body).Decode(&user)
-    msg := Register(user)
-    w.Write([]byte(msg))
+type TransferRequest struct {
+	FromUserID int     `json:"from_user_id"`
+	ToUserID   int     `json:"to_user_id"`
+	Amount     float64 `json:"amount"`
 }
 
-func LoginUser(w http.ResponseWriter, r *http.Request) {
-    var user User
-    json.NewDecoder(r.Body).Decode(&user)
-    msg := Login(user.Email, user.Password)
-    w.Write([]byte(msg))
+func CreditHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID int     `json:"user_id"`
+		Amount float64 `json:"amount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	res := Credit(req.UserID, req.Amount)
+	json.NewEncoder(w).Encode(res)
 }
 
-func GetUsers(w http.ResponseWriter, r *http.Request) {
-    json.NewEncoder(w).Encode(GetAllUsers())
+func DebitHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID int     `json:"user_id"`
+		Amount float64 `json:"amount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	res, ok := Debit(req.UserID, req.Amount)
+	if !ok {
+		http.Error(w, "Insufficient balance", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(res)
 }
 
-func GetUser(w http.ResponseWriter, r *http.Request) {
-    vars := mux.Vars(r)
-    idStr := vars["id"]
-    id, _ := strconv.Atoi(idStr)
+func TransferHandler(w http.ResponseWriter, r *http.Request) {
+	var req TransferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	res, ok := Transfer(req.FromUserID, req.ToUserID, req.Amount)
+	if !ok {
+		http.Error(w, "Insufficient balance", http.StatusBadRequest)
+		return
+	}
+	json.NewEncoder(w).Encode(res)
+}
 
-    user := GetUserByID(id)
-    if user == nil {
-        http.Error(w, "User not found", http.StatusNotFound)
-        return
-    }
+func BalanceHandler(w http.ResponseWriter, r *http.Request) {
+	userIDStr := r.Header.Get("User-ID")
+	userID, _ := strconv.Atoi(userIDStr)
+	balance := GetBalance(userID)
+	json.NewEncoder(w).Encode(map[string]float64{"balance": balance})
+}
 
-    json.NewEncoder(w).Encode(user)
+func AllTransactionsHandler(w http.ResponseWriter, r *http.Request) {
+	list := GetAllTransactions()
+	json.NewEncoder(w).Encode(list)
 }
